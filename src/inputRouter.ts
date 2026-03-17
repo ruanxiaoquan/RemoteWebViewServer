@@ -1,5 +1,5 @@
 import type { DeviceSession } from "./deviceManager.js";
-import { TouchKind, parseFrameStatsPacket, parseOpenURLPacket, parseTouchPacket } from "./protocol.js";
+import { TouchKind, KeyAction, parseFrameStatsPacket, parseOpenURLPacket, parseTouchPacket, parseKeyPacket } from "./protocol.js";
 import { mapPointForRotation } from "./util.js";
 
 export class InputRouter {
@@ -26,6 +26,23 @@ export class InputRouter {
   public async handleFrameStatsPacketAsync(dev: DeviceSession, buf: Buffer): Promise<void> {
     const value = parseFrameStatsPacket(buf);
     dev.selfTestRunner?.setFrameRenderTimeAsync(value ?? 0, dev.cdp);
+  }
+
+  public async handleKeyPacketAsync(dev: DeviceSession, buf: Buffer): Promise<void> {
+    const pkt = parseKeyPacket(buf);
+    if (!pkt) return;
+
+    try {
+      const type = pkt.action === KeyAction.Down ? 'keyDown' as const : 'keyUp' as const;
+
+      if (pkt.action === KeyAction.Down && pkt.key.length === 1) {
+        await dev.cdp.send('Input.dispatchKeyEvent', { type, key: pkt.key, text: pkt.key });
+      } else {
+        await dev.cdp.send('Input.dispatchKeyEvent', { type, key: pkt.key });
+      }
+    } catch (e) {
+      console.warn(`Failed to dispatch key event: ${(e as Error).message}`);
+    }
   }
 
   public async handleOpenURLPacketAsync(dev: DeviceSession, buf: Buffer): Promise<void> {

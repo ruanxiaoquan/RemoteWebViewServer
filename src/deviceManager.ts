@@ -63,8 +63,13 @@ export async function ensureDeviceAsync(id: string, cfg: DeviceConfig): Promise<
   await session.send('Emulation.setDeviceMetricsOverride', {
     width: cfg.width,
     height: cfg.height,
-    deviceScaleFactor: 1,
+    deviceScaleFactor: 2,
     mobile: true
+  });
+  await session.send('Emulation.setUserAgentOverride', {
+    userAgent: 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+    acceptLanguage: 'zh-CN,zh;q=0.9',
+    platform: 'Linux armv8l',
   });
   if (PREFERS_REDUCED_MOTION) {
     await session.send('Emulation.setEmulatedMedia', {

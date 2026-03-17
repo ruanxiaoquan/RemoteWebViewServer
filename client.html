@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Remote WebView</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;overflow:hidden;background:#111;font-family:-apple-system,sans-serif;color:#fff}
+#panel{position:fixed;top:0;left:0;right:0;z-index:10;padding:12px;background:rgba(0,0,0,.85);display:flex;flex-direction:column;gap:8px}
+#panel input{width:100%;padding:8px 10px;border:1px solid #555;border-radius:6px;background:#222;color:#fff;font-size:14px}
+#panel .row{display:flex;gap:8px}
+#panel button{flex:none;padding:8px 18px;border:none;border-radius:6px;font-size:14px;font-weight:600;cursor:pointer}
+#btnConnect{background:#2563eb;color:#fff}
+#btnDisconnect{background:#dc2626;color:#fff;display:none}
+#status{position:fixed;bottom:0;left:0;right:0;z-index:10;padding:6px 12px;background:rgba(0,0,0,.75);font-size:12px;display:flex;justify-content:space-between}
+canvas{display:block;position:fixed;top:0;left:0;touch-action:none}
+</style>
+</head>
+<body>
+<div id="panel">
+  <input id="inputUrl" type="url" placeholder="目标网址，如 https://example.com" value="">
+  <div class="row">
+    <input id="inputWs" type="text" placeholder="WebSocket 地址 (留空自动检测)" style="flex:1">
+    <button id="btnConnect">连接</button>
+    <button id="btnDisconnect">断开</button>
+  </div>
+</div>
+<canvas id="canvas"></canvas>
+<div id="status">
+  <span id="stState">未连接</span>
+  <span id="stFps">FPS: --</span>
+</div>
+
+<script>
+(function() {
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const inputUrl = document.getElementById('inputUrl');
+  const inputWs = document.getElementById('inputWs');
+  const btnConnect = document.getElementById('btnConnect');
+  const btnDisconnect = document.getElementById('btnDisconnect');
+  const stState = document.getElementById('stState');
+  const stFps = document.getElementById('stFps');
+
+  let ws = null;
+  let reconnectTimer = null;
+  let shouldReconnect = false;
+  let frameCount = 0;
+  let lastFpsTime = performance.now();
+
+  // --- Canvas sizing ---
+  function resizeCanvas() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+  }
+  resizeCanvas();
+  window.addEventListener('resize', resizeCanvas);
+
+  // --- FPS counter ---
+  setInterval(function() {
+    const now = performance.now();
+    const dt = (now - lastFpsTime) / 1000;
+    stFps.textContent = 'FPS: ' + (dt > 0 ? (frameCount / dt).toFixed(1) : '--');
+    frameCount = 0;
+    lastFpsTime = now;
+  }, 1000);
+
+  // --- Protocol constants ---
+  const FRAME_HEADER = 11;
+  const TILE_HEADER = 12;
+  const MSG_FRAME = 1;
+  const MSG_TOUCH = 2;
+  const MSG_OPENURL = 4;
+  const MSG_KEY = 6;
+  const TOUCH_DOWN = 1, TOUCH_MOVE = 2, TOUCH_UP = 3;
+  const KEY_DOWN = 0, KEY_UP = 1;
+
+  // --- Parse and render frame ---
+  function handleBinaryMessage(data) {
+    const buf = new DataView(data);
+    const type = buf.getUint8(0);
+    if (type !== MSG_FRAME) return;
+
+    const tileCount = buf.getUint16(7, true);
+    let offset = FRAME_HEADER;
+
+    for (let i = 0; i < tileCount; i++) {
+      if (offset + TILE_HEADER > data.byteLength) break;
+      const x = buf.getUint16(offset, true);
+      const y = buf.getUint16(offset + 2, true);
+      const w = buf.getUint16(offset + 4, true);
+      const h = buf.getUint16(offset + 6, true);
+      const dlen = buf.getUint32(offset + 8, true);
+      offset += TILE_HEADER;
+
+      if (offset + dlen > data.byteLength) break;
+      const jpegData = new Uint8Array(data, offset, dlen);
+      offset += dlen;
+
+      drawTile(jpegData, x, y, w, h);
+    }
+    frameCount++;
+  }
+
+  function drawTile(jpegBytes, x, y, w, h) {
+    const blob = new Blob([jpegBytes], { type: 'image/jpeg' });
+    createImageBitmap(blob).then(function(bmp) {
+      ctx.drawImage(bmp, x, y, w, h);
+      bmp.close();
+    }).catch(function() {});
+  }
+
+  // --- Build touch packet (8 bytes) ---
+  function buildTouchPacket(kind, pointerId, x, y) {
+    const buf = new ArrayBuffer(8);
+    const dv = new DataView(buf);
+    dv.setUint8(0, MSG_TOUCH);
+    dv.setUint8(1, 1); // version
+    dv.setUint8(2, kind);
+    dv.setUint8(3, pointerId & 0xff);
+    dv.setUint16(4, Math.max(0, Math.min(0xffff, Math.round(x))), true);
+    dv.setUint16(6, Math.max(0, Math.min(0xffff, Math.round(y))), true);
+    return buf;
+  }
+
+  // --- Build OpenURL packet ---
+  function buildOpenURLPacket(url) {
+    const urlBytes = new TextEncoder().encode(url);
+    const buf = new ArrayBuffer(8 + urlBytes.length);
+    const dv = new DataView(buf);
+    dv.setUint8(0, MSG_OPENURL);
+    dv.setUint8(1, 1); // version
+    dv.setUint16(2, 0, true); // flags
+    dv.setUint32(4, urlBytes.length, true);
+    new Uint8Array(buf, 8).set(urlBytes);
+    return buf;
+  }
+
+  // --- Build key packet: [type=6 u8][ver=1 u8][action u8][key_len u16LE][key utf8] ---
+  function buildKeyPacket(action, key) {
+    var keyBytes = new TextEncoder().encode(key);
+    var buf = new ArrayBuffer(5 + keyBytes.length);
+    var dv = new DataView(buf);
+    dv.setUint8(0, MSG_KEY);
+    dv.setUint8(1, 1);
+    dv.setUint8(2, action);
+    dv.setUint16(3, keyBytes.length, true);
+    new Uint8Array(buf, 5).set(keyBytes);
+    return buf;
+  }
+
+  // --- Keyboard events ---
+  document.addEventListener('keydown', function(e) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    // Don't capture when typing in input fields
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+    e.preventDefault();
+    ws.send(buildKeyPacket(KEY_DOWN, e.key));
+  });
+  document.addEventListener('keyup', function(e) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+    e.preventDefault();
+    ws.send(buildKeyPacket(KEY_UP, e.key));
+  });
+
+  // --- Touch events ---
+  function touchHandler(e) {
+    e.preventDefault();
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+    var kind;
+    switch (e.type) {
+      case 'touchstart': kind = TOUCH_DOWN; break;
+      case 'touchmove':  kind = TOUCH_MOVE; break;
+      case 'touchend': case 'touchcancel': kind = TOUCH_UP; break;
+      default: return;
+    }
+
+    var touches = (kind === TOUCH_UP) ? e.changedTouches : e.touches;
+    for (var i = 0; i < touches.length; i++) {
+      var t = touches[i];
+      ws.send(buildTouchPacket(kind, t.identifier, t.clientX, t.clientY));
+    }
+  }
+
+  canvas.addEventListener('touchstart', touchHandler, { passive: false });
+  canvas.addEventListener('touchmove', touchHandler, { passive: false });
+  canvas.addEventListener('touchend', touchHandler, { passive: false });
+  canvas.addEventListener('touchcancel', touchHandler, { passive: false });
+
+  // Mouse fallback for desktop testing
+  var mouseDown = false;
+  canvas.addEventListener('mousedown', function(e) {
+    mouseDown = true;
+    if (ws && ws.readyState === WebSocket.OPEN)
+      ws.send(buildTouchPacket(TOUCH_DOWN, 0, e.clientX, e.clientY));
+  });
+  canvas.addEventListener('mousemove', function(e) {
+    if (!mouseDown || !ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(buildTouchPacket(TOUCH_MOVE, 0, e.clientX, e.clientY));
+  });
+  canvas.addEventListener('mouseup', function(e) {
+    mouseDown = false;
+    if (ws && ws.readyState === WebSocket.OPEN)
+      ws.send(buildTouchPacket(TOUCH_UP, 0, e.clientX, e.clientY));
+  });
+
+  // --- Connection ---
+  function getWsUrl(targetUrl) {
+    var wsAddr = inputWs.value.trim();
+    if (!wsAddr) {
+      var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      wsAddr = proto + '//' + location.hostname + ':8081';
+    }
+    var w = window.innerWidth;
+    var h = window.innerHeight;
+    var params = '?id=h5&w=' + w + '&h=' + h + '&q=85&mbpm=65536';
+    return wsAddr + params;
+  }
+
+  function connect() {
+    if (ws) return;
+    var targetUrl = inputUrl.value.trim();
+    var wsUrl = getWsUrl(targetUrl);
+    shouldReconnect = true;
+
+    stState.textContent = '连接中...';
+    ws = new WebSocket(wsUrl);
+    ws.binaryType = 'arraybuffer';
+
+    ws.onopen = function() {
+      stState.textContent = '已连接';
+      btnConnect.style.display = 'none';
+      btnDisconnect.style.display = '';
+      // Send OpenURL packet to navigate the remote browser
+      if (targetUrl) {
+        var urlToSend = targetUrl;
+        if (!/^https?:\/\//i.test(urlToSend)) urlToSend = 'https://' + urlToSend;
+        ws.send(buildOpenURLPacket(urlToSend));
+      }
+      // Hide panel after connection
+      document.getElementById('panel').style.transform = 'translateY(-100%)';
+      document.getElementById('panel').style.transition = 'transform 0.3s';
+    };
+
+    ws.onmessage = function(e) {
+      if (e.data instanceof ArrayBuffer) {
+        handleBinaryMessage(e.data);
+      }
+    };
+
+    ws.onclose = function() {
+      ws = null;
+      stState.textContent = '已断开';
+      btnConnect.style.display = '';
+      btnDisconnect.style.display = 'none';
+      document.getElementById('panel').style.transform = '';
+
+      if (shouldReconnect) {
+        stState.textContent = '重连中...';
+        reconnectTimer = setTimeout(connect, 2000);
+      }
+    };
+
+    ws.onerror = function() {
+      stState.textContent = '连接错误';
+    };
+  }
+
+  function disconnect() {
+    shouldReconnect = false;
+    clearTimeout(reconnectTimer);
+    if (ws) ws.close();
+  }
+
+  btnConnect.addEventListener('click', connect);
+  btnDisconnect.addEventListener('click', disconnect);
+
+  // Show panel on tap at top
+  var panelEl = document.getElementById('panel');
+  document.addEventListener('click', function(e) {
+    if (e.clientY < 30 && panelEl.style.transform) {
+      panelEl.style.transform = '';
+    }
+  });
+})();
+</script>
+</body>
+</html>

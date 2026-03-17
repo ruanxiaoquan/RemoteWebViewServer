@@ -16,6 +16,9 @@
 // Keepalive message:
 //   [type u8=5][ver u8=1]
 //
+// Key message:
+//   [type u8=6][ver u8=1][action u8][key_len u16][key utf8 bytes...]
+//   action: 0=keyDown, 1=keyUp
 
 export const PROTOCOL_VERSION = 1 as const;
 
@@ -26,6 +29,7 @@ export enum MsgType {
   FrameStats  = 3,
   OpenURL     = 4,
   Keepalive   = 5,
+  Key         = 6,
 }
 
 export enum Encoding {
@@ -75,6 +79,12 @@ export const TILE_HEADER_BYTES  = 2 + 2 + 2 + 2 + 4;      // 12
 export const TOUCH_BYTES        = 1 + 1 + 1 + 1 + 2 + 2;  // 8
 export const FRAME_STATS_BYTES  = 1 + 1 + 4 + 4;          // 10
 export const OPENURL_HEADER_BYTES = 1 + 1 + 2 + 4;        // 8
+export const KEY_HEADER_BYTES     = 1 + 1 + 1 + 2;        // 5
+
+export enum KeyAction {
+  Down = 0,
+  Up   = 1,
+}
 
 const clampU16 = (v: number) => (v < 0 ? 0 : v > 0xffff ? 0xffff : v|0);
 
@@ -225,4 +235,23 @@ export function* iterateTiles(buf: Buffer, startOffset = FRAME_HEADER_BYTES, exp
     yield { x, y, w, h, data, nextOffset: off };
     if (expectedCount && seen >= expectedCount) break;
   }
+}
+
+export interface KeyPacket {
+  action: KeyAction;
+  key: string;
+}
+
+export function parseKeyPacket(buf: Buffer): KeyPacket | null {
+  if (!Buffer.isBuffer(buf) || buf.length < KEY_HEADER_BYTES) return null;
+  if (buf.readUInt8(0) !== MsgType.Key) return null;
+  if (buf.readUInt8(1) !== PROTOCOL_VERSION) return null;
+
+  const action = buf.readUInt8(2) as KeyAction;
+  const keyLen = buf.readUInt16LE(3);
+
+  if (KEY_HEADER_BYTES + keyLen > buf.length) return null;
+  const key = buf.subarray(KEY_HEADER_BYTES, KEY_HEADER_BYTES + keyLen).toString('utf8');
+
+  return { action, key };
 }

@@ -1,4 +1,7 @@
 import http from 'http';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { WebSocketServer } from "ws"
 import env from "env-var";
 import { makeConfigFromParams, setConfigFor, logDeviceConfig } from "./config.js";
@@ -6,6 +9,9 @@ import { broadcaster, ensureDeviceAsync, cleanupIdleAsync } from './deviceManage
 import { InputRouter } from "./inputRouter.js";
 import { bootstrapAsync } from './browser.js';
 import { MsgType } from './protocol.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const CLIENT_HTML_PATH = path.resolve(__dirname, '..', 'client.html');
 
 const WS_PORT = env.get("WS_PORT").default("8081").asIntPositive();
 const HEALTH_PORT = env.get("HEALTH_PORT").default("18080").asIntPositive();
@@ -43,6 +49,9 @@ wss.on("connection", async (ws, req) => {
       case MsgType.OpenURL:
         inputRouter.handleOpenURLPacketAsync(dev, buf).catch(e => console.warn(`Failed to handle OpenURL packet: ${(e as Error).message}`));
         break;
+      case MsgType.Key:
+        inputRouter.handleKeyPacketAsync(dev, buf).catch(e => console.warn(`Failed to handle Key packet: ${(e as Error).message}`));
+        break;
     }
   })
 
@@ -54,7 +63,16 @@ wss.on("connection", async (ws, req) => {
 
 http.createServer(async (req, res) => {
   try {
-    res.writeHead(200); res.end('ok');
+    const urlPath = new URL(req.url || '/', `http://localhost:${HEALTH_PORT}`).pathname;
+    if (urlPath === '/' || urlPath === '/client') {
+      const html = fs.readFileSync(CLIENT_HTML_PATH, 'utf-8');
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(html);
+    } else if (urlPath === '/health') {
+      res.writeHead(200); res.end('ok');
+    } else {
+      res.writeHead(200); res.end('ok');
+    }
   } catch (e) {
     res.writeHead(500); res.end('err');
   }
