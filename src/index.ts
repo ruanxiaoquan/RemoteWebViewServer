@@ -38,7 +38,7 @@ wss.on("connection", async (ws, req) => {
     const buf: Buffer = Buffer.isBuffer(msg) ? msg : Buffer.from(msg as ArrayBuffer);
     switch (buf.readUInt8(0)) {
       case MsgType.Touch:
-        inputRouter.handleTouchPacketAsync(dev, buf).catch(e => console.warn(`Failed to handle touch packet: ${(e as Error).message}`));
+        inputRouter.handleTouchPacketAsync(dev, buf);
         break;
       case MsgType.Keepalive:
         dev.lastActive = Date.now();

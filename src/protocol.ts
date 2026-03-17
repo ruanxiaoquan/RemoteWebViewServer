@@ -72,11 +72,13 @@ export interface TouchPacket {
   pointerId: number;
   x: number;
   y: number;
+  /** 客户端 Date.now() 的低 32 位（ms），用于在 CDP 中还原真实时间戳 */
+  clientTs?: number;
 }
 
 export const FRAME_HEADER_BYTES = 1 + 1 + 4 + 1 + 2 + 2;  // 11
 export const TILE_HEADER_BYTES  = 2 + 2 + 2 + 2 + 4;      // 12
-export const TOUCH_BYTES        = 1 + 1 + 1 + 1 + 2 + 2;  // 8
+export const TOUCH_BYTES        = 1 + 1 + 1 + 1 + 2 + 2 + 4;  // 12 (added 4-byte client timestamp)
 export const FRAME_STATS_BYTES  = 1 + 1 + 4 + 4;          // 10
 export const OPENURL_HEADER_BYTES = 1 + 1 + 2 + 4;        // 8
 export const KEY_HEADER_BYTES     = 1 + 1 + 1 + 2;        // 5
@@ -100,18 +102,20 @@ export function buildTouchPacket(kind: TouchKind, x: number, y: number, pointerI
 }
 
 export function parseTouchPacket(buf: Buffer): TouchPacket | null {
-  if (!Buffer.isBuffer(buf) || buf.length < TOUCH_BYTES) return null;
+  if (!Buffer.isBuffer(buf) || buf.length < 8) return null; // 兼容旧 8-byte 包
   if (buf.readUInt8(0) !== MsgType.Touch) return null;
   if (buf.readUInt8(1) !== PROTOCOL_VERSION) return null;
   
   const kind = buf.readUInt8(2);
-  if (kind > TouchKind.Up) return null;
+  if (kind > TouchKind.Tap) return null;
   
   const pointerId = buf.readUInt8(3);
   const x = buf.readUInt16LE(4);
   const y = buf.readUInt16LE(6);
+  // 新格式：第 8-11 字节是客户端时间戳低 32 位
+  const clientTs = buf.length >= 12 ? buf.readUInt32LE(8) : undefined;
   
-  return { kind, pointerId, x, y };
+  return { kind, pointerId, x, y, clientTs };
 }
 
 export function parseFrameStatsPacket(buf: Buffer): number | null {

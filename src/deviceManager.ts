@@ -61,41 +61,133 @@ export async function ensureDeviceAsync(id: string, cfg: DeviceConfig): Promise<
 
   await session.send('Page.enable');
 
-  // Hide automation/webdriver flags
+  // Hide automation/webdriver flags — comprehensive anti-detection
   await session.send('Page.addScriptToEvaluateOnNewDocument', {
     source: `
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-      Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
-      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-      window.chrome = { runtime: {} };
-      const originalQuery = window.navigator.permissions.query;
-      window.navigator.permissions.query = (parameters) =>
-        parameters.name === 'notifications'
-          ? Promise.resolve({ state: Notification.permission })
-          : originalQuery(parameters);
+      (() => {
+        const _def = (obj, prop, val) => {
+          try { Object.defineProperty(obj, prop, { get: () => val, configurable: true }); } catch(_) {}
+        };
+
+        // webdriver
+        _def(navigator, 'webdriver', undefined);
+
+        // 语言 / 硬件
+        _def(navigator, 'languages', ['zh-CN', 'zh', 'en-US', 'en']);
+        _def(navigator, 'language',  'zh-CN');
+        _def(navigator, 'hardwareConcurrency', 4);
+        _def(navigator, 'deviceMemory', 4);
+        _def(navigator, 'platform', 'Linux armv8l');
+
+        // 触摸点数量（Pixel 7 = 5，默认 headless = 0，是关键检测点）
+        _def(navigator, 'maxTouchPoints', 5);
+
+        // devicePixelRatio（Pixel 7 ≈ 2.625；headless 默认 1 是强自动化信号）
+        _def(window, 'devicePixelRatio', 2.625);
+
+        // plugins — 符合 PluginArray 类型
+        const fakePArr = Object.create(PluginArray.prototype);
+        _def(fakePArr, 'length', 3);
+        _def(navigator, 'plugins', fakePArr);
+
+        // Chrome API stubs（headless 下这些会缺失）
+        if (!window.chrome) window.chrome = {};
+        if (!window.chrome.runtime) window.chrome.runtime = {};
+        window.chrome.loadTimes = function() {
+          const t = Date.now() / 1000;
+          return { requestTime: t-1.5, startLoadTime: t-1.2, commitLoadTime: t-0.8,
+            finishDocumentLoadTime: t-0.2, finishLoadTime: t-0.1,
+            firstPaintTime: t-0.3, firstPaintAfterLoadTime: 0,
+            navigationType: 'Other', wasFetchedViaSpdy: true,
+            wasNpnNegotiated: true, npnNegotiatedProtocol: 'h2',
+            wasAlternateProtocolAvailable: false, connectionInfo: 'h2' };
+        };
+        window.chrome.csi = function() {
+          return { startE: Date.now()-800, onloadT: Date.now()-100, pageT: 700, tran: 15 };
+        };
+        window.chrome.app = {
+          isInstalled: false,
+          InstallState: { DISABLED:'disabled', INSTALLED:'installed', NOT_INSTALLED:'not_installed' },
+          RunningState: { CANNOT_RUN:'cannot_run', READY_TO_RUN:'ready_to_run', RUNNING:'running' },
+        };
+
+        // outerWidth/Height（headless 下默认 0）
+        _def(window, 'outerWidth',  window.innerWidth  || screen.width);
+        _def(window, 'outerHeight', window.innerHeight || screen.height);
+
+        // permissions
+        const _origPermQuery = window.navigator.permissions.query.bind(navigator.permissions);
+        window.navigator.permissions.query = (p) =>
+          p.name === 'notifications'
+            ? Promise.resolve({ state: Notification.permission, onchange: null })
+            : _origPermQuery(p);
+
+        // Notification.permission
+        try { Object.defineProperty(Notification, 'permission', { get: () => 'default' }); } catch(_) {}
+
+        // Connection API（移动端常见）
+        if (!navigator.connection) {
+          _def(navigator, 'connection', {
+            effectiveType: '4g', downlink: 10, rtt: 50,
+            saveData: false, type: 'wifi',
+          });
+        }
+      })();
     `
   });
 
   await session.send('Emulation.setDeviceMetricsOverride', {
     width: cfg.width,
     height: cfg.height,
-    deviceScaleFactor: 2,
-    mobile: true
+    deviceScaleFactor: 1,
+    mobile: true,
+    screenWidth: cfg.width,
+    screenHeight: cfg.height,
   });
+
+  // 启用触摸仿真：maxTouchPoints=0 是最常见的自动化检测点之一
+  await session.send('Emulation.setTouchEmulationEnabled', {
+    enabled: true,
+    maxTouchPoints: 5,
+  });
+
   await session.send('Emulation.setUserAgentOverride', {
     userAgent: 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
     acceptLanguage: 'zh-CN,zh;q=0.9',
     platform: 'Linux armv8l',
+    // Client Hints — 必须与 UA 一致，否则 navigator.userAgentData 会暴露真实的 macOS/x86
+    userAgentMetadata: {
+      brands: [
+        { brand: 'Not_A Brand', version: '8' },
+        { brand: 'Chromium', version: '120' },
+        { brand: 'Google Chrome', version: '120' },
+      ],
+      fullVersion: '120.0.6099.109',
+      platform: 'Android',
+      platformVersion: '13',
+      architecture: 'arm',
+      model: 'Pixel 7',
+      mobile: true,
+      bitness: '64',
+      wow64: false,
+    },
   });
-  if (PREFERS_REDUCED_MOTION) {
-    await session.send('Emulation.setEmulatedMedia', {
-      media: 'screen',
-      features: [{ name: 'prefers-reduced-motion', value: 'reduce' }],
-    });
-  }
+
+  // pointer:coarse + hover:none 告知页面是真实移动触控设备
+  await session.send('Emulation.setEmulatedMedia', {
+    media: 'screen',
+    features: [
+      { name: 'pointer', value: 'coarse' },
+      { name: 'hover', value: 'none' },
+      { name: 'any-pointer', value: 'coarse' },
+      { name: 'any-hover', value: 'none' },
+      ...(PREFERS_REDUCED_MOTION ? [{ name: 'prefers-reduced-motion', value: 'reduce' }] : []),
+    ],
+  });
 
   await session.send('Page.startScreencast', {
-    format: 'png',
+    format: 'jpeg',
+    quality: 90,
     maxWidth: cfg.width,
     maxHeight: cfg.height,
     everyNthFrame: cfg.everyNthFrame
@@ -137,16 +229,16 @@ export async function ensureDeviceAsync(id: string, cfg: DeviceConfig): Promise<
     if (!b64) return;
 
     try {
-      const pngFull = Buffer.from(b64, 'base64');
+      const imgBuf = Buffer.from(b64, 'base64');
 
-      const h32 = hash32(pngFull);
+      const h32 = hash32(imgBuf);
       if (dev.prevFrameHash === h32) {
         dev.lastProcessedMs = Date.now();
         return;
       }
       dev.prevFrameHash = h32;
 
-      let img = sharp(pngFull);
+      let img = sharp(imgBuf);
       if (dev.cfg.rotation) img = img.rotate(dev.cfg.rotation);
 
       const { data, info } = await img

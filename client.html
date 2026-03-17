@@ -8,25 +8,11 @@
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{width:100%;height:100%;overflow:hidden;background:#111;font-family:-apple-system,sans-serif;color:#fff}
-#panel{position:fixed;top:0;left:0;right:0;z-index:10;padding:12px;background:rgba(0,0,0,.85);display:flex;flex-direction:column;gap:8px}
-#panel input{width:100%;padding:8px 10px;border:1px solid #555;border-radius:6px;background:#222;color:#fff;font-size:14px}
-#panel .row{display:flex;gap:8px}
-#panel button{flex:none;padding:8px 18px;border:none;border-radius:6px;font-size:14px;font-weight:600;cursor:pointer}
-#btnConnect{background:#2563eb;color:#fff}
-#btnDisconnect{background:#dc2626;color:#fff;display:none}
-#status{position:fixed;bottom:0;left:0;right:0;z-index:10;padding:6px 12px;background:rgba(0,0,0,.75);font-size:12px;display:flex;justify-content:space-between}
+#status{position:fixed;top:0;left:0;right:0;z-index:10;padding:6px 12px;background:rgba(0,0,0,.75);font-size:12px;display:flex;justify-content:space-between}
 canvas{display:block;position:fixed;top:0;left:0;touch-action:none}
 </style>
 </head>
 <body>
-<div id="panel">
-  <input id="inputUrl" type="url" placeholder="目标网址，如 https://example.com" value="">
-  <div class="row">
-    <input id="inputWs" type="text" placeholder="WebSocket 地址 (留空自动检测)" style="flex:1">
-    <button id="btnConnect">连接</button>
-    <button id="btnDisconnect">断开</button>
-  </div>
-</div>
 <canvas id="canvas"></canvas>
 <div id="status">
   <span id="stState">未连接</span>
@@ -37,10 +23,6 @@ canvas{display:block;position:fixed;top:0;left:0;touch-action:none}
 (function() {
   const canvas = document.getElementById('canvas');
   const ctx = canvas.getContext('2d');
-  const inputUrl = document.getElementById('inputUrl');
-  const inputWs = document.getElementById('inputWs');
-  const btnConnect = document.getElementById('btnConnect');
-  const btnDisconnect = document.getElementById('btnDisconnect');
   const stState = document.getElementById('stState');
   const stFps = document.getElementById('stFps');
 
@@ -67,6 +49,9 @@ canvas{display:block;position:fixed;top:0;left:0;touch-action:none}
     lastFpsTime = now;
   }, 1000);
 
+  // 固定打开的页面（美团经营宝登录），不支持用户修改
+  const FIXED_TARGET_URL = 'https://epassport.meituan.com/portal/login?bg_source=1&service=com.sankuai.meishi.fe.ecom&part_type=0&feconfig=bssoify&biz_line=1&continue=https%3A%2F%2Fecom.meituan.com%2Fbizaccount%2Fbiz-choice.html%3Fredirect_uri%3Dhttps%253A%252F%252Fe.dianping.com%252Fapp%252Fmerchant-platform%252Ffe6031ae4f544c4%253FiUrl%253DLy9lLmRpYW5waW5nLmNvbS9hcHAvbWVyY2hhbnQtd29ya2JlbmNoL2luZGV4Lmh0bWwjLw%26_t%3D1767340831854%26target%3Dhttps%253A%252F%252Fe.dianping.com%252Fapp%252Fmerchant-platform%252Ffe6031ae4f544c4%253FiUrl%253DLy9lLmRpYW5waW5nLmNvbS9hcHAvbWVyY2hhbnQtd29ya2JlbmNoL2luZGV4Lmh0bWwjLw&leftBottomLink=&signUpTarget=self';
+
   // --- Protocol constants ---
   const FRAME_HEADER = 11;
   const TILE_HEADER = 12;
@@ -76,52 +61,87 @@ canvas{display:block;position:fixed;top:0;left:0;touch-action:none}
   const MSG_KEY = 6;
   const TOUCH_DOWN = 1, TOUCH_MOVE = 2, TOUCH_UP = 3;
   const KEY_DOWN = 0, KEY_UP = 1;
+  const FLAG_LAST_OF_FRAME = 1;
+
+  // 帧组装 & 序号保序状态
+  let pendingFrameId = -1;
+  let pendingTiles = [];       // 当前帧累积的 tile 数据 {x,y,w,h,jpeg}
+  let lastRenderedFrameId = -1; // 上一次绘制成功的帧 ID（用于丢弃乱序帧）
 
   // --- Parse and render frame ---
+  // 支持：① 多包帧组装（同一 frameId 分多条消息）② 乱序帧丢弃（旧帧解码完成后不覆盖新帧）
   function handleBinaryMessage(data) {
-    const buf = new DataView(data);
-    const type = buf.getUint8(0);
-    if (type !== MSG_FRAME) return;
+    const dv = new DataView(data);
+    if (dv.getUint8(0) !== MSG_FRAME) return;
 
-    const tileCount = buf.getUint16(7, true);
+    const frameId = dv.getUint32(2, true);   // bytes 2-5
+    const tileCount = dv.getUint16(7, true); // bytes 7-8
+    const flags = dv.getUint16(9, true);     // bytes 9-10
+
+    // 新帧到来时重置累积器（丢弃上一帧未完成的残包）
+    if (frameId !== pendingFrameId) {
+      pendingFrameId = frameId;
+      pendingTiles = [];
+    }
+
+    // 从当前消息中提取 tile 原始数据（拷贝以防 ArrayBuffer 被回收）
     let offset = FRAME_HEADER;
-
     for (let i = 0; i < tileCount; i++) {
       if (offset + TILE_HEADER > data.byteLength) break;
-      const x = buf.getUint16(offset, true);
-      const y = buf.getUint16(offset + 2, true);
-      const w = buf.getUint16(offset + 4, true);
-      const h = buf.getUint16(offset + 6, true);
-      const dlen = buf.getUint32(offset + 8, true);
+      const x = dv.getUint16(offset,     true);
+      const y = dv.getUint16(offset + 2, true);
+      const w = dv.getUint16(offset + 4, true);
+      const h = dv.getUint16(offset + 6, true);
+      const dlen = dv.getUint32(offset + 8, true);
       offset += TILE_HEADER;
-
       if (offset + dlen > data.byteLength) break;
-      const jpegData = new Uint8Array(data, offset, dlen);
+      pendingTiles.push({ x, y, w, h, jpeg: data.slice(offset, offset + dlen) });
       offset += dlen;
-
-      drawTile(jpegData, x, y, w, h);
     }
-    frameCount++;
-  }
 
-  function drawTile(jpegBytes, x, y, w, h) {
-    const blob = new Blob([jpegBytes], { type: 'image/jpeg' });
-    createImageBitmap(blob).then(function(bmp) {
-      ctx.drawImage(bmp, x, y, w, h);
-      bmp.close();
+    // 收到本帧最后一个包才解码并绘制
+    if (!(flags & FLAG_LAST_OF_FRAME)) return;
+
+    const tilesToRender = pendingTiles;
+    const capturedFrameId = frameId;
+    pendingTiles = [];
+    pendingFrameId = -1;
+
+    // 同帧所有 tile 并行解码，全部就绪后原子绘制
+    Promise.all(tilesToRender.map(function(t) {
+      const blob = new Blob([t.jpeg], { type: 'image/jpeg' });
+      return createImageBitmap(blob).then(function(bmp) {
+        return { bmp, x: t.x, y: t.y, w: t.w, h: t.h };
+      });
+    })).then(function(tiles) {
+      // 序号检查：丢弃已过时的帧（处理环绕溢出：差值超过一半时认为反向）
+      const diff = (capturedFrameId - lastRenderedFrameId) & 0xFFFFFFFF;
+      if (lastRenderedFrameId !== -1 && diff > 0x7FFFFFFF) {
+        tiles.forEach(function(t) { t.bmp.close(); });
+        return;
+      }
+      lastRenderedFrameId = capturedFrameId;
+      tiles.forEach(function(t) {
+        ctx.drawImage(t.bmp, t.x, t.y, t.w, t.h);
+        t.bmp.close();
+      });
+      frameCount++;
     }).catch(function() {});
   }
 
-  // --- Build touch packet (8 bytes) ---
+  // --- Build touch packet (12 bytes, 含客户端真实时间戳) ---
+  // 格式: [type u8][ver u8][kind u8][id u8][x u16][y u16][ts_lo u32]
+  // ts_lo = Date.now() & 0xffffffff，服务端用于还原 CDP event.timeStamp
   function buildTouchPacket(kind, pointerId, x, y) {
-    const buf = new ArrayBuffer(8);
+    const buf = new ArrayBuffer(12);
     const dv = new DataView(buf);
     dv.setUint8(0, MSG_TOUCH);
-    dv.setUint8(1, 1); // version
+    dv.setUint8(1, 1);
     dv.setUint8(2, kind);
     dv.setUint8(3, pointerId & 0xff);
     dv.setUint16(4, Math.max(0, Math.min(0xffff, Math.round(x))), true);
     dv.setUint16(6, Math.max(0, Math.min(0xffff, Math.round(y))), true);
+    dv.setUint32(8, Date.now() >>> 0, true); // 低 32 位时间戳
     return buf;
   }
 
@@ -166,65 +186,79 @@ canvas{display:block;position:fixed;top:0;left:0;touch-action:none}
     ws.send(buildKeyPacket(KEY_UP, e.key));
   });
 
-  // --- Touch events ---
+  // --- Touch / Mouse input ---
+  // 每个事件立即发送（无 rAF 节流），服务端并发处理 MOVE、等待最后 MOVE 完成后才发 UP
+  function send(pkt) {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(pkt);
+  }
+
   function touchHandler(e) {
     e.preventDefault();
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
-    var kind;
     switch (e.type) {
-      case 'touchstart': kind = TOUCH_DOWN; break;
-      case 'touchmove':  kind = TOUCH_MOVE; break;
-      case 'touchend': case 'touchcancel': kind = TOUCH_UP; break;
-      default: return;
-    }
-
-    var touches = (kind === TOUCH_UP) ? e.changedTouches : e.touches;
-    for (var i = 0; i < touches.length; i++) {
-      var t = touches[i];
-      ws.send(buildTouchPacket(kind, t.identifier, t.clientX, t.clientY));
+      case 'touchstart':
+        for (var i = 0; i < e.changedTouches.length; i++) {
+          var t = e.changedTouches[i];
+          send(buildTouchPacket(TOUCH_DOWN, t.identifier, t.clientX, t.clientY));
+        }
+        break;
+      case 'touchmove':
+        // 使用 getCoalescedEvents() 获取帧间全部采样点（支持时则用）
+        var src = (e.getCoalescedEvents ? e.getCoalescedEvents() : null) || [e];
+        for (var i = 0; i < src.length; i++) {
+          var ev = src[i];
+          var touches = ev.touches || e.touches;
+          for (var j = 0; j < touches.length; j++) {
+            var t = touches[j];
+            send(buildTouchPacket(TOUCH_MOVE, t.identifier, t.clientX, t.clientY));
+          }
+        }
+        break;
+      case 'touchend':
+      case 'touchcancel':
+        for (var i = 0; i < e.changedTouches.length; i++) {
+          var t = e.changedTouches[i];
+          send(buildTouchPacket(TOUCH_UP, t.identifier, t.clientX, t.clientY));
+        }
+        break;
     }
   }
 
-  canvas.addEventListener('touchstart', touchHandler, { passive: false });
-  canvas.addEventListener('touchmove', touchHandler, { passive: false });
-  canvas.addEventListener('touchend', touchHandler, { passive: false });
+  canvas.addEventListener('touchstart',  touchHandler, { passive: false });
+  canvas.addEventListener('touchmove',   touchHandler, { passive: false });
+  canvas.addEventListener('touchend',    touchHandler, { passive: false });
   canvas.addEventListener('touchcancel', touchHandler, { passive: false });
 
-  // Mouse fallback for desktop testing
+  // Mouse（桌面端）
   var mouseDown = false;
   canvas.addEventListener('mousedown', function(e) {
     mouseDown = true;
-    if (ws && ws.readyState === WebSocket.OPEN)
-      ws.send(buildTouchPacket(TOUCH_DOWN, 0, e.clientX, e.clientY));
+    send(buildTouchPacket(TOUCH_DOWN, 0, e.clientX, e.clientY));
   });
   canvas.addEventListener('mousemove', function(e) {
-    if (!mouseDown || !ws || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(buildTouchPacket(TOUCH_MOVE, 0, e.clientX, e.clientY));
+    if (!mouseDown) return;
+    send(buildTouchPacket(TOUCH_MOVE, 0, e.clientX, e.clientY));
   });
   canvas.addEventListener('mouseup', function(e) {
     mouseDown = false;
-    if (ws && ws.readyState === WebSocket.OPEN)
-      ws.send(buildTouchPacket(TOUCH_UP, 0, e.clientX, e.clientY));
+    send(buildTouchPacket(TOUCH_UP, 0, e.clientX, e.clientY));
   });
 
   // --- Connection ---
-  function getWsUrl(targetUrl) {
-    var wsAddr = inputWs.value.trim();
-    if (!wsAddr) {
-      var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      wsAddr = proto + '//' + location.hostname + ':8081';
-    }
+  function getWsUrl() {
+    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    var wsAddr = proto + '//' + location.hostname + ':8081';
     var w = window.innerWidth;
     var h = window.innerHeight;
-    var params = '?id=h5&w=' + w + '&h=' + h + '&q=85&mbpm=65536';
+    var params = '?id=h5&w=' + w + '&h=' + h + '&q=80&mbpm=131072&mfi=0';
     return wsAddr + params;
   }
 
   function connect() {
     if (ws) return;
-    var targetUrl = inputUrl.value.trim();
-    var wsUrl = getWsUrl(targetUrl);
+    var targetUrl = FIXED_TARGET_URL;
+    var wsUrl = getWsUrl();
     shouldReconnect = true;
 
     stState.textContent = '连接中...';
@@ -233,17 +267,12 @@ canvas{display:block;position:fixed;top:0;left:0;touch-action:none}
 
     ws.onopen = function() {
       stState.textContent = '已连接';
-      btnConnect.style.display = 'none';
-      btnDisconnect.style.display = '';
-      // Send OpenURL packet to navigate the remote browser
+      // Send OpenURL packet to navigate the remote browser to fixed page
       if (targetUrl) {
         var urlToSend = targetUrl;
         if (!/^https?:\/\//i.test(urlToSend)) urlToSend = 'https://' + urlToSend;
         ws.send(buildOpenURLPacket(urlToSend));
       }
-      // Hide panel after connection
-      document.getElementById('panel').style.transform = 'translateY(-100%)';
-      document.getElementById('panel').style.transition = 'transform 0.3s';
     };
 
     ws.onmessage = function(e) {
@@ -255,10 +284,6 @@ canvas{display:block;position:fixed;top:0;left:0;touch-action:none}
     ws.onclose = function() {
       ws = null;
       stState.textContent = '已断开';
-      btnConnect.style.display = '';
-      btnDisconnect.style.display = 'none';
-      document.getElementById('panel').style.transform = '';
-
       if (shouldReconnect) {
         stState.textContent = '重连中...';
         reconnectTimer = setTimeout(connect, 2000);
@@ -270,22 +295,8 @@ canvas{display:block;position:fixed;top:0;left:0;touch-action:none}
     };
   }
 
-  function disconnect() {
-    shouldReconnect = false;
-    clearTimeout(reconnectTimer);
-    if (ws) ws.close();
-  }
-
-  btnConnect.addEventListener('click', connect);
-  btnDisconnect.addEventListener('click', disconnect);
-
-  // Show panel on tap at top
-  var panelEl = document.getElementById('panel');
-  document.addEventListener('click', function(e) {
-    if (e.clientY < 30 && panelEl.style.transform) {
-      panelEl.style.transform = '';
-    }
-  });
+  // 进入页面后自动连接并打开默认链接
+  connect();
 })();
 </script>
 </body>
