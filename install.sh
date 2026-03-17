@@ -95,6 +95,39 @@ install_pm2() {
   fi
 }
 
+# ── 安装中文字体（Linux only，避免 headless Chrome 中文方框） ─
+install_cjk_fonts() {
+  if [[ "$OS" == "macos" ]]; then return; fi
+  step "安装中文字体（避免远程页面中文显示为方框）"
+  case "$OS" in
+    debian)
+      if dpkg -l fonts-noto-cjk &>/dev/null; then
+        success "中文字体已安装（fonts-noto-cjk）"
+      else
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends fonts-noto-cjk fonts-noto-cjk-extra fontconfig
+        sudo fc-cache -f -v
+        success "中文字体安装完成"
+      fi
+      ;;
+    rhel)
+      if rpm -q noto-cjk-fonts-common &>/dev/null 2>/dev/null; then
+        success "中文字体已安装"
+      else
+        sudo yum install -y fontconfig || true
+        sudo yum install -y google-noto-sans-cjk-fonts google-noto-serif-cjk-fonts 2>/dev/null || \
+        sudo yum install -y noto-cjk-fonts 2>/dev/null || \
+        warn "请手动安装中文字体，例如：yum install google-noto-sans-cjk-fonts"
+        sudo fc-cache -f -v 2>/dev/null || true
+        success "中文字体安装完成"
+      fi
+      ;;
+    *)
+      warn "当前系统未自动安装字体，若出现中文方框请手动安装 Noto CJK 或文泉驿字体"
+      ;;
+  esac
+}
+
 # ── 安装 Playwright 浏览器依赖（Linux only） ────────────────
 install_playwright_deps() {
   if [[ "$OS" == "macos" ]]; then return; fi
@@ -339,6 +372,8 @@ main() {
   install_node
   install_npm
   install_pm2
+
+  install_cjk_fonts
 
   install_deps
 

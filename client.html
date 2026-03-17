@@ -8,15 +8,23 @@
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{width:100%;height:100%;overflow:hidden;background:#111;font-family:-apple-system,sans-serif;color:#fff}
-#status{position:fixed;top:0;left:0;right:0;z-index:10;padding:6px 12px;background:rgba(0,0,0,.75);font-size:12px;display:flex;justify-content:space-between}
+#status{position:fixed;top:0;left:0;right:0;z-index:10;padding:6px 12px;background:rgba(0,0,0,.75);font-size:12px;display:flex;justify-content:space-between;align-items:center}
+#kbdBtn{cursor:pointer;padding:0 8px;font-size:16px;color:#666;user-select:none;-webkit-user-select:none;transition:color .15s}
+#kbdBtn.active{color:#facc15}
 canvas{display:block;position:fixed;top:0;left:0;touch-action:none}
+/* 隐藏键盘桥接输入框：opacity:0 对 iOS Safari 可聚焦；font-size≥16px 防止 iOS 自动放大 */
+#hiddenKbdInput{position:fixed;top:0;left:-9999px;width:1px;height:40px;opacity:0;font-size:16px;border:none;outline:none;resize:none;background:transparent;color:transparent;overflow:hidden;z-index:-1;-webkit-user-select:text;user-select:text}
 </style>
 </head>
 <body>
 <canvas id="canvas"></canvas>
+<textarea id="hiddenKbdInput" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false"></textarea>
 <div id="status">
   <span id="stState">未连接</span>
-  <span id="stFps">FPS: --</span>
+  <span style="display:flex;align-items:center;gap:6px">
+    <span id="kbdBtn" title="唤起键盘">⌨</span>
+    <span id="stFps">FPS: --</span>
+  </span>
 </div>
 
 <script>
@@ -25,6 +33,8 @@ canvas{display:block;position:fixed;top:0;left:0;touch-action:none}
   const ctx = canvas.getContext('2d');
   const stState = document.getElementById('stState');
   const stFps = document.getElementById('stFps');
+  const kbdBtn = document.getElementById('kbdBtn');
+  const hiddenKbdInput = document.getElementById('hiddenKbdInput');
 
   let ws = null;
   let reconnectTimer = null;
@@ -171,19 +181,108 @@ canvas{display:block;position:fixed;top:0;left:0;touch-action:none}
     return buf;
   }
 
-  // --- Keyboard events ---
+  // --- 桌面键盘事件（非移动端使用）---
   document.addEventListener('keydown', function(e) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    // Don't capture when typing in input fields
+    if (e.target === hiddenKbdInput) return; // 由移动键盘桥接处理
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
     e.preventDefault();
     ws.send(buildKeyPacket(KEY_DOWN, e.key));
   });
   document.addEventListener('keyup', function(e) {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    if (e.target === hiddenKbdInput) return;
     if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
     e.preventDefault();
     ws.send(buildKeyPacket(KEY_UP, e.key));
+  });
+
+  // ─── 移动端虚拟键盘桥接 ───────────────────────────────────
+  // 策略：用隐藏 textarea 聚焦弹出原生键盘，监听 input/composition 事件转发到远端
+  var kbdActive = false;
+  var isComposing = false;
+  var prevKbdValue = '';
+
+  function sendChar(ch) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(buildKeyPacket(KEY_DOWN, ch));
+    ws.send(buildKeyPacket(KEY_UP, ch));
+  }
+  function sendSpecialKey(key) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(buildKeyPacket(KEY_DOWN, key));
+    ws.send(buildKeyPacket(KEY_UP, key));
+  }
+
+  function showKbd() {
+    kbdActive = true;
+    kbdBtn.classList.add('active');
+    hiddenKbdInput.value = '';
+    prevKbdValue = '';
+    // iOS Safari: focus() 必须在用户手势中同步调用
+    hiddenKbdInput.focus();
+  }
+  function hideKbd() {
+    kbdActive = false;
+    kbdBtn.classList.remove('active');
+    hiddenKbdInput.blur();
+  }
+
+  // 中文 IME 组合输入：compositionend 时一次性发送最终汉字
+  hiddenKbdInput.addEventListener('compositionstart', function() {
+    isComposing = true;
+  });
+  hiddenKbdInput.addEventListener('compositionend', function(e) {
+    isComposing = false;
+    var composed = e.data || '';
+    for (var i = 0; i < composed.length; i++) sendChar(composed[i]);
+    // 重置，避免 input 事件重复处理
+    hiddenKbdInput.value = '';
+    prevKbdValue = '';
+  });
+
+  // 普通字符输入：对比前后 value 判断增减
+  hiddenKbdInput.addEventListener('input', function() {
+    if (isComposing) return;
+    var cur = hiddenKbdInput.value;
+    var prev = prevKbdValue;
+    if (cur.length > prev.length) {
+      var added = cur.slice(prev.length);
+      for (var i = 0; i < added.length; i++) sendChar(added[i]);
+    } else if (cur.length < prev.length) {
+      var dels = prev.length - cur.length;
+      for (var i = 0; i < dels; i++) sendSpecialKey('Backspace');
+    }
+    prevKbdValue = cur;
+    // 防止 textarea 无限积累
+    if (hiddenKbdInput.value.length > 60) {
+      hiddenKbdInput.value = hiddenKbdInput.value.slice(-20);
+      prevKbdValue = hiddenKbdInput.value;
+    }
+  });
+
+  // 特殊键（不产生 input 事件）
+  hiddenKbdInput.addEventListener('keydown', function(e) {
+    if (isComposing) return;
+    var specials = ['Enter','Tab','Escape','ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Home','End'];
+    if (specials.indexOf(e.key) !== -1) {
+      e.preventDefault();
+      sendSpecialKey(e.key);
+    }
+  });
+
+  // 键盘收起时更新状态
+  hiddenKbdInput.addEventListener('blur', function() {
+    if (kbdActive) {
+      kbdActive = false;
+      kbdBtn.classList.remove('active');
+    }
+  });
+
+  // 状态栏键盘按钮点击
+  kbdBtn.addEventListener('click', function(e) {
+    e.stopPropagation();
+    if (kbdActive) hideKbd(); else showKbd();
   });
 
   // --- Touch / Mouse input ---
@@ -192,12 +291,20 @@ canvas{display:block;position:fixed;top:0;left:0;touch-action:none}
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(pkt);
   }
 
+  // 点击检测状态
+  var tapStartX = 0, tapStartY = 0, tapStartTime = 0;
+
   function touchHandler(e) {
     e.preventDefault();
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
     switch (e.type) {
       case 'touchstart':
+        if (e.changedTouches.length === 1) {
+          tapStartX = e.changedTouches[0].clientX;
+          tapStartY = e.changedTouches[0].clientY;
+          tapStartTime = Date.now();
+        }
         for (var i = 0; i < e.changedTouches.length; i++) {
           var t = e.changedTouches[i];
           send(buildTouchPacket(TOUCH_DOWN, t.identifier, t.clientX, t.clientY));
@@ -220,6 +327,15 @@ canvas{display:block;position:fixed;top:0;left:0;touch-action:none}
         for (var i = 0; i < e.changedTouches.length; i++) {
           var t = e.changedTouches[i];
           send(buildTouchPacket(TOUCH_UP, t.identifier, t.clientX, t.clientY));
+        }
+        // 点击检测：单指、位移 < 12px、时长 < 300ms → 弹出键盘
+        if (e.type === 'touchend' && e.changedTouches.length === 1) {
+          var dx = Math.abs(e.changedTouches[0].clientX - tapStartX);
+          var dy = Math.abs(e.changedTouches[0].clientY - tapStartY);
+          var dt = Date.now() - tapStartTime;
+          if (dx < 12 && dy < 12 && dt < 300) {
+            showKbd();
+          }
         }
         break;
     }

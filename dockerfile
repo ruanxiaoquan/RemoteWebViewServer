@@ -16,6 +16,13 @@ RUN npm prune --omit=dev
 
 FROM mcr.microsoft.com/playwright:v1.55.0-jammy AS runner
 WORKDIR /app
+# 安装中文字体，避免 headless Chrome 渲染中文为方框
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    fonts-noto-cjk \
+    fonts-noto-cjk-extra \
+    fontconfig \
+    && fc-cache -f -v \
+    && rm -rf /var/lib/apt/lists/*
 ENV NODE_ENV=production \
     PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
