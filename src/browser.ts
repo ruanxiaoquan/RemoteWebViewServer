@@ -30,6 +30,7 @@ async function startHeadlessIfNeededAsync(): Promise<void> {
     '--no-sandbox',
     '--force-device-scale-factor=1',
     '--headless=new',
+    '--disable-blink-features=AutomationControlled',
     ...(PREFERS_REDUCED_MOTION ? ['--force-prefers-reduced-motion'] : []),
   ];
 

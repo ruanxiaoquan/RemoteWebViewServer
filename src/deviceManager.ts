@@ -60,6 +60,22 @@ export async function ensureDeviceAsync(id: string, cfg: DeviceConfig): Promise<
   const session = (root as any).session(sessionId);
 
   await session.send('Page.enable');
+
+  // Hide automation/webdriver flags
+  await session.send('Page.addScriptToEvaluateOnNewDocument', {
+    source: `
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+      window.chrome = { runtime: {} };
+      const originalQuery = window.navigator.permissions.query;
+      window.navigator.permissions.query = (parameters) =>
+        parameters.name === 'notifications'
+          ? Promise.resolve({ state: Notification.permission })
+          : originalQuery(parameters);
+    `
+  });
+
   await session.send('Emulation.setDeviceMetricsOverride', {
     width: cfg.width,
     height: cfg.height,
